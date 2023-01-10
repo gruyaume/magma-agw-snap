@@ -1,6 +1,6 @@
 name: magma-access-gateway
 base: core20
-version: '1.8'
+version: '1.9'
 summary: Magma's core network
 description: Magma's core network
 
@@ -8,16 +8,6 @@ grade: devel
 confinement: devmode
 
 package-repositories:
-  - type: apt
-    components:
-      - main
-    suites:
-      - focal-1.7.0
-      - focal-ci
-    formats: [deb]
-    url: https://linuxfoundation.jfrog.io/artifactory/magma-packages-test
-    key-id: FB072E500E692F4E33379EE506E3BFB19BA418A8
-    key-server: https://linuxfoundation.jfrog.io/artifactory/api/security/keypair/magmaci/public
   - type: apt
     components:
       - jdk1.8
@@ -28,6 +18,126 @@ package-repositories:
     key-server: https://bazel.build/bazel-release.pub.gpg
 
 parts:
+
+  bcc-tools:
+    plugin: cmake
+    source: https://github.com/iovisor/bcc.git
+    source-type: git
+    source-branch: v0.23.0
+    cmake-parameters:
+      - -DPYTHON_CMD=python3
+    build-packages:
+      - bison
+      - flex
+      - libedit-dev
+      - libllvm7
+      - llvm-7-dev
+      - libclang-7-dev
+      - python3
+      - zlib1g-dev
+      - libelf-dev
+      - libfl-dev
+      - luajit
+      - libluajit-5.1-dev
+
+  liblfds:
+    plugin: make
+    source: https://liblfds.org/git/liblfds
+    source-type: git
+    override-build: |
+      set -x
+      cd liblfds/liblfds7.1.0/liblfds710/build/gcc_gnumake
+      make so_vanilla
+      mkdir -p $SNAPCRAFT_PART_INSTALL/usr/local/include $SNAPCRAFT_PART_INSTALL/usr/local/lib
+      make INSINCDIR="$SNAPCRAFT_PART_INSTALL/usr/local/include" INSLIBDIR="$SNAPCRAFT_PART_INSTALL/usr/local/lib" so_install
+
+  oai-asn1c:
+    plugin: autotools
+    source: https://gitlab.eurecom.fr/oai/asn1c.git
+    source-type: git
+    source-commit: f12568d617dbf48497588f8e227d70388fa217c9
+
+  oai-gnutls:
+    plugin: autotools
+    after:
+      - oai-nettle
+    source: http://mirrors.dotsrc.org/gcrypt/gnutls/v3.1/gnutls-3.1.23.tar.xz
+    source-type: tar
+    autotools-configure-parameters:
+      - --with-libnettle-prefix=/root/parts/oai-nettle/install/usr/local/
+    build-packages:
+      - libtasn1-6-dev
+      - libp11-kit-dev
+      - libtspi-dev
+      - libidn2-0-dev
+      - libidn11-dev
+    stage-packages:
+      - libidn11
+      - libtspi1
+    override-build: |
+      set -x
+      patch gl/stdio-impl.h <<'EOF'
+      @@ -18,6 +18,9 @@
+          the same implementation of stdio extension API, except that some fields
+          have different naming conventions, or their access requires some casts.  */
+
+      +#if !defined _IO_IN_BACKUP && defined _IO_EOF_SEEN
+      +# define _IO_IN_BACKUP 0x100
+      +#endif
+
+       /* BSD stdio derived implementations.  */
+
+      EOF
+      patch gl/fseterr.c <<'EOF'
+      @@ -29,7 +29,7 @@
+         /* Most systems provide FILE as a struct and the necessary bitmask in
+            <stdio.h>, because they need it for implementing getc() and putc() as
+            fast macros.  */
+      -#if defined _IO_ftrylockfile || __GNU_LIBRARY__ == 1 /* GNU libc, BeOS, Haiku, Linux libc5 */
+      +#if defined _IO_EOF_SEEN || __GNU_LIBRARY__ == 1 /* GNU libc, BeOS, Haiku, Linux libc5 */
+         fp->_flags |= _IO_ERR_SEEN;
+       #elif defined __sferror || defined __DragonFly__ /* FreeBSD, NetBSD, OpenBSD, DragonFly, Mac OS X, Cygwin */
+         fp_->_flags |= __SERR;
+      EOF
+      snapcraftctl build
+
+  oai-freediameter:
+    plugin: cmake
+    after:
+      - oai-gnutls
+    source: .
+    cmake-parameters:
+      - -DCMAKE_C_FLAGS=-DOLD_SCTP_SOCKET_API=1
+    stage-packages:
+      - libidn11
+      - libsctp1
+      - libtspi1
+    override-build: |
+      set -x
+      cd $SNAPCRAFT_PART_SRC
+      rm -rf opencord.org.freeDiameter
+      git clone https://github.com/lionelgo/opencord.org.freeDiameter.git
+      cd opencord.org.freeDiameter
+      git checkout 13b0e7de0d66906d50e074a339f890d6e59813ad
+      patch -p1 < "$SNAPCRAFT_PART_SRC/patches/oai-freediameter/0001-opencoord.org.freeDiameter.patch"
+      patch -p1 < "$SNAPCRAFT_PART_SRC/patches/oai-freediameter/0002-opencoord.org.freeDiameter.patch"
+      awk '{if (/^DISABLE_SCTP/) gsub(/OFF/, "ON"); print}' CMakeCache.txt > tmp && mv tmp CMakeCache.txt
+      cp -rf $SNAPCRAFT_PART_SRC/opencord.org.freeDiameter/* $SNAPCRAFT_PART_SRC/
+
+      cp -rf -L /root/parts/oai-gnutls/install/usr/local/lib/* /usr/local/lib/
+      cp -rf -L /root/parts/oai-gnutls/install/usr/local/include/* /usr/local/include/
+
+      snapcraftctl build
+
+  oai-nettle:
+    plugin: autotools
+    source: https://ftp.gnu.org/gnu/nettle/nettle-2.5.tar.gz
+    source-type: tar
+    build-packages:
+      - libgmp-dev
+    autotools-configure-parameters:
+      - --disable-openssl
+      - --enable-shared
 
   fmt:
     plugin: cmake
@@ -56,6 +166,18 @@ parts:
       - libboost-chrono-dev
       - libiberty-dev
       - libssl-dev
+    stage-packages:
+      - libboost-context1.71.0
+      - libboost-filesystem1.71.0
+      - libboost-program-options1.71.0
+      - libboost-regex1.71.0
+      - libdouble-conversion3
+      - libevent-2.1-7
+      - libgflags2.2
+      - libgoogle-glog0v5
+      - libicu66
+      - libsodium23
+      - libunwind8
     override-build: |
       set -x
       cp -r /root/parts/fmt/install/usr/local/include/* /usr/local/include/
@@ -66,13 +188,17 @@ parts:
     plugin: nil
     after:
       - folly
+      - bcc-tools
+      - oai-asn1c
+      - oai-freediameter
+      - oai-gnutls
+      - oai-nettle
     source: https://github.com/magma/magma
     source-type: git
     build-packages:
       - apt-transport-https
       - apt-utils
       - bazel=5.2.0
-      - bcc-tools
       - bison
       - build-essential
       - ca-certificates
@@ -90,7 +216,6 @@ parts:
       - libgcrypt-dev
       - libgmp3-dev
       - libidn11-dev
-      - liblfds710
       - libmnl-dev=1.0.4-2
       - libpcap-dev=1.9.1-3
       - libsctp1
@@ -100,10 +225,6 @@ parts:
       - libsystemd-dev
       - lld
       - net-tools
-      - oai-asn1c
-      - oai-freediameter
-      - oai-gnutls
-      - oai-nettle
       - netbase
       - python3.8
       - python-is-python3
@@ -114,16 +235,26 @@ parts:
       - libtool=2.4.6-14
     override-build: |
       set -x
-      cp -r /root/parts/folly/install/usr/local/include/* /usr/local/include/
-      cp -r /root/parts/folly/install/usr/local/lib/* /usr/local/lib/
-      mkdir -p /workspaces/magma /etc/magma/
-      cp -r . /workspaces/magma/
-      cp -r lte/gateway/configs /etc/magma/
-      ln -f -s /workspaces/magma/.bazel-cache /var/cache/bazel-cache
-      ln -f -s /workspaces/magma/.bazel-cache-repo /var/cache/bazel-cache-repo
-
-      bazel build lte/gateway/release:sctpd_deb_pkg --config=production
-
-      ls -lrta /workspaces/magma/lte/gateway/
-      ls -lrta /workspaces/magma/lte/gateway/release/
-      cp -r /workspaces/magma/lte/gateway/release/
+      
+      cp -r -L /root/parts/folly/install/usr/local/include/* /usr/local/include/
+      cp -r -L /root/parts/folly/install/usr/local/lib/* /usr/local/lib/
+      
+      cp -r -L /root/parts/oai-gnutls/install/usr/local/include/* /usr/include/
+      cp -r -L /root/parts/oai-gnutls/install/usr/local/lib/* /usr/lib/
+      cp -r -L /root/parts/oai-gnutls/install/usr/local/bin/* /usr/bin/
+      cp -r -L /root/parts/oai-gnutls/install/usr/local/share/* /usr/share/
+      
+      cp -r -L /root/parts/oai-nettle/install/usr/local/include/* /usr/include/
+      cp -r -L /root/parts/oai-nettle/install/usr/local/lib/* /usr/lib/
+      cp -r -L /root/parts/oai-nettle/install/usr/local/bin/* /usr/bin/
+      cp -r -L /root/parts/oai-nettle/install/usr/local/share/* /usr/share/
+      
+      cp -r -L /root/parts/oai-asn1c/install/usr/local/bin/* /usr/local/bin/
+      cp -r -L /root/parts/oai-asn1c/install/usr/local/share/* /usr/local/share/
+      
+      cp -r -L /root/parts/oai-freediameter/install/usr/local/include/* /usr/local/include/
+      cp -r -L /root/parts/oai-freediameter/install/usr/local/lib/* /usr/local/lib/
+      cp -r -L /root/parts/oai-freediameter/install/usr/local/bin/* /usr/local/bin/
+      
+      bazel build lte/gateway/release:release_build --config=production
+      cp -L -r bazel-bin/lte/gateway/release/* $SNAPCRAFT_PART_INSTALL/
